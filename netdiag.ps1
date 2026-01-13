@@ -8,13 +8,6 @@ param(
     [ValidateSet("json","text")]
     [string]$Format = "json",
 
-    # TCP connectivity tests (host:port)
-    [string[]]$TestTcp = @(
-        "8.8.8.8:53",
-        "1.1.1.1:53",
-        "github.com:443"
-    ),
-
     # DNS resolution tests
     [string[]]$TestDns = @(
         "github.com",
@@ -68,64 +61,24 @@ function Get-WifiInfo {
         $raw = netsh wlan show interfaces 2>$null
         if (-not $raw) { return $null }
 
-        $ssid   = ($raw | Select-String '^\s*SSID\s*:\s*(.+)$' | Select-Object -First 1).Matches.Groups[1].Value
+        $ssidMatch = ($raw | Select-String '^\s*SSID\s*:\s*(.+)$' | Select-Object -First 1)
+        if (-not $ssidMatch) { return $null }
+
+        $ssid = $ssidMatch.Matches.Groups[1].Value
         if ([string]::IsNullOrWhiteSpace($ssid)) { return $null }
+
+        $bssidMatch  = ($raw | Select-String '^\s*BSSID\s*:\s*(.+)$' | Select-Object -First 1)
+        $signalMatch = ($raw | Select-String '^\s*Signal\s*:\s*(.+)$' | Select-Object -First 1)
+        $radioMatch  = ($raw | Select-String '^\s*Radio type\s*:\s*(.+)$' | Select-Object -First 1)
 
         return @{
             ssid      = $ssid.Trim()
-            bssid     = ($raw | Select-String '^\s*BSSID\s*:\s*(.+)$').Matches.Groups[1].Value.Trim()
-            signal    = ($raw | Select-String '^\s*Signal\s*:\s*(.+)$').Matches.Groups[1].Value.Trim()
-            radioType = ($raw | Select-String '^\s*Radio type\s*:\s*(.+)$').Matches.Groups[1].Value.Trim()
+            bssid     = if ($bssidMatch) { $bssidMatch.Matches.Groups[1].Value.Trim() } else { $null }
+            signal    = if ($signalMatch) { $signalMatch.Matches.Groups[1].Value.Trim() } else { $null }
+            radioType = if ($radioMatch) { $radioMatch.Matches.Groups[1].Value.Trim() } else { $null }
         }
     } catch {
         return $null
-    }
-}
-
-function Test-TcpConnection {
-    param([string]$Target)
-
-    if ($Target -notmatch '^(.*):(\d+)$') {
-        return @{
-            target = $Target
-            ok = $false
-            error = "Invalid format (use host:port)"
-        }
-    }
-
-    $host = $Matches[1]
-    $port = [int]$Matches[2]
-
-    try {
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $client = New-Object System.Net.Sockets.TcpClient
-        $iar = $client.BeginConnect($host, $port, $null, $null)
-
-        if (-not $iar.AsyncWaitHandle.WaitOne(2500, $false)) {
-            $client.Close()
-            return @{
-                target = $Target
-                ok = $false
-                latencyMs = 2500
-                error = "Timeout"
-            }
-        }
-
-        $client.EndConnect($iar)
-        $sw.Stop()
-        $client.Close()
-
-        return @{
-            target = $Target
-            ok = $true
-            latencyMs = [int]$sw.ElapsedMilliseconds
-        }
-    } catch {
-        return @{
-            target = $Target
-            ok = $false
-            error = $_.Exception.Message
-        }
     }
 }
 
@@ -183,23 +136,25 @@ function Get-ListeningTcpPorts {
 $os = $null
 try { $os = Get-CimInstance Win32_OperatingSystem } catch {}
 
+$arch = $null
+try { $arch = (Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty AddressWidth) } catch {}
+
 $result = @{
-    generatedAt = (Get-Date).ToString("o")
+    generatedAt  = (Get-Date).ToString("o")
     computerName = $env:COMPUTERNAME
-    userName = "$env:USERDOMAIN\$env:USERNAME"
+    userName     = "$env:USERDOMAIN\$env:USERNAME"
     os = if ($os) {
         @{
-            caption = $os.Caption
-            version = $os.Version
-            buildNumber = $os.BuildNumber
-            architecture = (Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty AddressWidth)
+            caption      = $os.Caption
+            version      = $os.Version
+            buildNumber  = $os.BuildNumber
+            architecture = $arch
         }
     } else { $null }
-    uptime = Get-Uptime
+    uptime   = Get-Uptime
     adapters = Get-NetworkAdapters
-    wifi = Get-WifiInfo
+    wifi     = Get-WifiInfo
     dnsTests = @($TestDns | ForEach-Object { Resolve-DnsNameSafe $_ })
-    tcpTests = @($TestTcp | ForEach-Object { Test-TcpConnection $_ })
 }
 
 if ($IncludePublicIp) {
@@ -222,7 +177,7 @@ if ($Format -eq "json") {
     Write-Host "User: $( $result.userName )"
 
     if ($result.os) {
-        Write-Host "OS: $( $result.os.caption )  Version: $( $result.os.version )  Build: $( $result.os.buildNumber )"
+        Write-Host "OS: $( $result.os.caption )  Version: $( $result.os.version )  Build: $( $result.os.buildNumber )  Arch: $( $result.os.architecture )"
     }
 
     if ($result.uptime) {
@@ -241,8 +196,8 @@ if ($Format -eq "json") {
     if ($result.wifi) {
         Write-Host "`nWi-Fi:"
         Write-Host " SSID:   $($result.wifi.ssid)"
-        Write-Host " Signal: $($result.wifi.signal)"
-        Write-Host " Radio:  $($result.wifi.radioType)"
+        if ($result.wifi.signal)    { Write-Host " Signal: $($result.wifi.signal)" }
+        if ($result.wifi.radioType) { Write-Host " Radio:  $($result.wifi.radioType)" }
     }
 
     Write-Host "`nDNS Tests:"
@@ -254,12 +209,16 @@ if ($Format -eq "json") {
         }
     }
 
-    Write-Host "`nTCP Tests:"
-    foreach ($t in $result.tcpTests) {
-        if ($t.ok) {
-            Write-Host " - $($t.target): OK ($($t.latencyMs) ms)"
-        } else {
-            Write-Host " - $($t.target): FAILED ($($t.error))"
+    if ($IncludePublicIp -and $result.publicIp) {
+        Write-Host "`nPublic IP:"
+        if ($result.publicIp.ip) { Write-Host " - $($result.publicIp.ip)" }
+        elseif ($result.publicIp.error) { Write-Host " - ERROR: $($result.publicIp.error)" }
+    }
+
+    if ($IncludeListeningPorts -and $result.listeningTcp) {
+        Write-Host "`nListening TCP Ports:"
+        foreach ($p in $result.listeningTcp) {
+            Write-Host " - $($p.localAddress):$($p.localPort) (PID $($p.pid))"
         }
     }
 }
